@@ -509,9 +509,17 @@ class FolderWatcher:
                 # dedup sweep writes -- records WHY the file has no item group, so a
                 # later scan can tell it apart from an ingest that produced nothing.
                 # The content_hash and mtime are stored with it, which is what lets
-                # an edit bring the file back into the scan.
-                self._update_state(source_id, file_path, content_hash, mtime, "[]", now,
-                                   "deduped", commit=False)
+                # an edit bring the file back into the scan. Off the loop, because
+                # it takes the write lock: BEGIN IMMEDIATE waits (up to the
+                # connection's timeout) on any concurrent writer, and waiting for a
+                # lock on the loop thread is the same stall this whole change exists
+                # to remove. run_to_completion rather than a bare to_thread, so a
+                # cancellation arriving while the work is still queued cannot drop
+                # the terminal write and leave a 'scanning' marker behind -- that row
+                # is re-ingested at full cost on every later sweep.
+                await run_to_completion(
+                    lambda: self._record_deduped_state(
+                        source_id, file_path, content_hash, mtime, now))
                 stats["skipped"] += 1
             else:
                 self._update_state(source_id, file_path, content_hash, mtime, json.dumps(item_ids), now, "done", commit=False)
@@ -670,6 +678,71 @@ class FolderWatcher:
         return row["error_message"] if row else None
 
     def _update_state(self, source_id: str, file_path: str, content_hash: str, mtime: float, item_ids: str, now: str, status: str = "done", error_message: str | None = None, *, attempts: int = 0, commit: bool = True):
+        self._write_state_row(source_id, file_path, content_hash, mtime, item_ids, now,
+                              status, error_message, attempts=attempts)
+        if commit:
+            self.store.db.commit()
+
+    def _deduped_text_hash(self, content_hash: str) -> str | None:
+        """Text hash for a row the pre-ingest gate refused, or ``None``.
+
+        A refused row owns nothing, so it has no items to derive the text hash
+        from -- and it is exactly the row that later needs one, because releasing
+        its claim is what stops a folder being handed a document whose file is
+        gone. Take it from the byte-identical row it was refused against: equal
+        bytes through the same reader give equal text, so this is derived rather
+        than guessed. ``None`` when there is no sibling to derive from; the
+        ownership lookup coalesces to content_hash for such a row, which is the
+        right answer wherever it can be reached (the gate can only have refused a
+        plaintext file in that situation, and for plaintext the two are equal).
+        """
+        if not content_hash:
+            return None
+        sib = self.store.db.execute(
+            "SELECT text_hash FROM folder_file_state "
+            "WHERE content_hash = ? AND text_hash IS NOT NULL LIMIT 1",
+            (content_hash,)).fetchone()
+        return sib["text_hash"] if sib else None
+
+    def _record_deduped_state(self, source_id: str, file_path: str, content_hash: str,
+                              mtime: float, now: str) -> None:
+        """Terminal write for a file the pre-ingest gate refused, taken under the lock.
+
+        The gate commits its own transaction before returning, so a
+        ``delete_source_cascade`` on the holder can land between that commit and
+        this write. That cascade is not destructive on its own -- it sees this
+        source's location row, reassigns the surviving item here, and adopts it
+        into THIS row. Writing an empty group unconditionally would erase that
+        adoption, leaving a 'deduped' row that names nothing while the only
+        remaining copy of the document is now owned by this source and reachable
+        from no state row at all: unreachable by the deleted-file path, and
+        undeletable, which is the strand the whole ownership model exists to
+        prevent.
+
+        So the group is READ here rather than assumed empty, and the read plus
+        the write are ONE ``BEGIN IMMEDIATE`` unit -- the same idiom the gate and
+        ``delete_source_cascade`` use. Taking the write lock means the cascade
+        either finished before this read (and its adoption is preserved, with the
+        healthy status that owning items implies) or waits until after this row
+        exists (and its own adoption step then fills the group in). Deriving the
+        group instead of predicting it is what closes the window for good: there
+        is no ordering left in which this write can contradict the database.
+        """
+        self.store.db.execute("BEGIN IMMEDIATE")
+        try:
+            adopted = [r["id"] for r in self.store.db.execute(
+                "SELECT id FROM items WHERE source_id = ? AND content_hash = ?",
+                (source_id, self._deduped_text_hash(content_hash) or content_hash),
+            ).fetchall()]
+            self._write_state_row(
+                source_id, file_path, content_hash, mtime, json.dumps(adopted), now,
+                "done" if adopted else "deduped")
+            self.store.db.execute("COMMIT")
+        except Exception:
+            self.store.db.execute("ROLLBACK")
+            raise
+
+    def _write_state_row(self, source_id: str, file_path: str, content_hash: str, mtime: float, item_ids: str, now: str, status: str = "done", error_message: str | None = None, *, attempts: int = 0):
         # Record the EXTRACTED-TEXT hash alongside the file-bytes one. Ownership
         # lookups have to relate this row to items, and items are keyed by the text
         # hash -- for a PDF or HTML file that is a different string from the bytes
@@ -687,23 +760,8 @@ class FolderWatcher:
                 "SELECT content_hash FROM items WHERE id = ?", (ids[0],)).fetchone()
             if row:
                 text_hash = row["content_hash"]
-        elif status == "deduped" and content_hash:
-            # A row refused by the pre-ingest gate owns nothing, so it has no items to
-            # derive the text hash from -- and it is exactly the row that later needs
-            # one, because releasing its claim is what stops a folder being handed a
-            # document whose file is gone. Take it from the byte-identical row it was
-            # refused against: equal bytes through the same reader give equal text, so
-            # this is derived rather than guessed.
-            sib = self.store.db.execute(
-                "SELECT text_hash FROM folder_file_state "
-                "WHERE content_hash = ? AND text_hash IS NOT NULL LIMIT 1",
-                (content_hash,)).fetchone()
-            if sib:
-                text_hash = sib["text_hash"]
-            # Left NULL when there is no sibling to derive from. The ownership lookup
-            # coalesces to content_hash for such a row, which is the right answer
-            # wherever it can be reached: the gate can only have refused a plaintext
-            # file in that situation, and for plaintext the two hashes are equal.
+        elif status == "deduped":
+            text_hash = self._deduped_text_hash(content_hash)
         # ``attempts`` defaults to 0, so every terminal write ('done', 'deduped',
         # 'failed') clears the retry budget as a side effect of not passing it: the
         # count only ever accumulates across consecutive 'scanning' markers, which is
@@ -711,8 +769,6 @@ class FolderWatcher:
         self.store.db.execute(
             "INSERT OR REPLACE INTO folder_file_state (source_id, file_path, content_hash, text_hash, mtime, item_ids, last_seen, status, error_message, attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (source_id, file_path, content_hash, text_hash, mtime, item_ids, now, status, error_message, attempts))
-        if commit:
-            self.store.db.commit()
 
     def _update_last_seen(self, source_id: str, file_path: str, now: str):
         self.store.db.execute(

@@ -860,28 +860,49 @@ class KnowledgeStore:
             return
         self.db.execute("BEGIN")
         try:
-            for item_id in item_ids:
-                if owner_source_id:
-                    others = self.sources_holding_item(
-                        item_id, exclude_source_id=owner_source_id)
-                    if others:
-                        self.reassign_item_source(item_id, others[0])
-                        self._adopt_reassigned_item(item_id, others[0])
-                        self.db.execute(
-                            "DELETE FROM source_locations "
-                            "WHERE item_id = ? AND source_id = ?",
-                            (item_id, owner_source_id))
-                        continue
-                self._delete_item_cascade(item_id)
-            self.db.execute("""
-                DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
-                AND id NOT IN (SELECT source_id FROM entity_relations)
-                AND id NOT IN (SELECT target_id FROM entity_relations)
-            """)
+            self.delete_items_batch_in_txn(item_ids, owner_source_id)
             self.db.execute("COMMIT")
         except Exception:
             self.db.execute("ROLLBACK")
             raise
+        self._load_graph()
+
+    def delete_items_batch_in_txn(self, item_ids: list[str],
+                                  owner_source_id: str | None = None):
+        """The body of :meth:`delete_items_batch`, for a caller already in a write txn.
+
+        Same semantics, minus the transaction and the graph reload, so a caller
+        that must delete and then record something ATOMICALLY can put both inside
+        one ``BEGIN IMMEDIATE`` -- otherwise the delete commits on its own and a
+        concurrent writer can act on the gap. Such a caller owns two duties:
+        commit the transaction, and call :meth:`reload_graph` afterwards, because
+        the orphan sweep below drops entities the in-memory graph still holds.
+        """
+        for item_id in item_ids:
+            if owner_source_id:
+                others = self.sources_holding_item(
+                    item_id, exclude_source_id=owner_source_id)
+                if others:
+                    self.reassign_item_source(item_id, others[0])
+                    self._adopt_reassigned_item(item_id, others[0])
+                    self.db.execute(
+                        "DELETE FROM source_locations "
+                        "WHERE item_id = ? AND source_id = ?",
+                        (item_id, owner_source_id))
+                    continue
+            self._delete_item_cascade(item_id)
+        self.db.execute("""
+            DELETE FROM entities WHERE id NOT IN (SELECT entity_id FROM mentions)
+            AND id NOT IN (SELECT source_id FROM entity_relations)
+            AND id NOT IN (SELECT target_id FROM entity_relations)
+        """)
+
+    def reload_graph(self) -> None:
+        """Rebuild the in-memory entity graph from the tables.
+
+        For a caller that ran :meth:`delete_items_batch_in_txn` and therefore owes
+        the reload that :meth:`delete_items_batch` would have done for it.
+        """
         self._load_graph()
 
     def dismiss_auto_source(self, uri: str) -> None:
@@ -1217,6 +1238,22 @@ class KnowledgeStore:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (lid, item_id, source_id, chunk_range, section_title, anchor, now))
         self.db.commit()
+
+    def add_source_location_in_txn(self, item_id, source_id, chunk_range=None,
+                                   section_title=None, anchor=None):
+        """:meth:`add_source_location` without the commit, for a caller in a write txn.
+
+        The connection runs in autocommit mode, so ``db.commit()`` inside an
+        explicit ``BEGIN IMMEDIATE`` would END that transaction early and hand a
+        concurrent writer the very gap the caller took the lock to close.
+        """
+        lid = str(uuid4())
+        now = datetime.now().isoformat()
+        self.db.execute(
+            "INSERT OR IGNORE INTO source_locations "
+            "(id, item_id, source_id, chunk_range, section_title, anchor, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (lid, item_id, source_id, chunk_range, section_title, anchor, now))
 
     def sources_holding_item(self, item_id: str, exclude_source_id: str | None = None) -> list[str]:
         """Ids of EXISTING sources that hold *item_id*, optionally excluding one.
