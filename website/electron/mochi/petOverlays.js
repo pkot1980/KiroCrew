@@ -49,6 +49,156 @@ const PET_H = 128;
 /** Force-stop a drag that never saw a mouseup (upstream value). */
 const DRAG_SAFETY_MS = 10_000;
 
+// ── Overlay auth-failure recovery ──────────────────────────────────────────
+//
+// A pet overlay covers a WHOLE display and is frameless, click-through and
+// always-on-top. If its `pet.html` load is answered with a gateway auth-failure
+// page (a token-required 401/403 — e.g. the session cookie expired while the
+// machine slept, and a reconnected display then builds a fresh overlay), that
+// opaque error page blankets the entire display with no title bar to close and
+// no click target: the only escape is force-quitting the whole app.
+//
+// A 401/403 is a COMPLETED navigation (the gateway serves an HTML body), so
+// `did-fail-load` never fires and `did-finish-load` DOES — meaning the overlay
+// would happily show the error page. `did-navigate`'s httpResponseCode is the
+// only signal that the page is an error, not the pet.
+
+/** Extra reload attempts after an auth-failure before giving up (stay blank). */
+const OVERLAY_REAUTH_MAX_RETRIES = 3;
+
+/** True when a main-frame navigation landed on a gateway auth-failure page. */
+function isOverlayAuthFailure(httpResponseCode) {
+  return httpResponseCode === 401 || httpResponseCode === 403;
+}
+
+/**
+ * True for ANY gateway error page on the main frame. A 4xx/5xx body is a
+ * COMPLETED navigation just like a 401/403, so it would otherwise be revealed
+ * and blanket the display in the same uncloseable way. Hiding is decided by
+ * this; re-minting a token is decided by isOverlayAuthFailure, since only an
+ * auth error heals with a fresh token.
+ */
+function isOverlayErrorPage(httpResponseCode) {
+  return typeof httpResponseCode === "number" && httpResponseCode >= 400;
+}
+
+/**
+ * Should we re-mint a token and reload the overlay, or give up and stay blank?
+ * Blank is always safe (the pet is briefly absent); showing the error page is
+ * not. Mirrors token-acquire.js's bounded self-heal policy.
+ */
+function shouldReauthOverlay({ attempt, hasProvider }) {
+  return Boolean(hasProvider) && attempt < OVERLAY_REAUTH_MAX_RETRIES;
+}
+
+/** Backoff before the next re-auth reload. Exponential, capped: 500ms,1s,2s. */
+function overlayReauthDelayMs(attempt) {
+  return Math.min(500 * 2 ** attempt, 2000);
+}
+
+/**
+ * Overlays currently showing an auth-failure page, so the load-finished handler
+ * knows NOT to reveal them. A WeakSet so a closed/GC'd window drops out on its
+ * own and never pins a dead BrowserWindow.
+ * @type {WeakSet<object>}
+ */
+const overlayAuthFailed = new WeakSet();
+
+/**
+ * Overlays hidden because their last main-frame navigation was a gateway error
+ * page (any status >= 400), so the load-finished handler knows NOT to reveal
+ * them and the reconcile tick knows which ones to re-arm. A WeakSet so a
+ * closed/GC'd window drops out on its own and never pins a dead BrowserWindow.
+ * @type {WeakSet<object>}
+ */
+const overlayBlanked = new WeakSet();
+
+/**
+ * Per-overlay budget for the FAST inline re-auth retry after a 401/403. A
+ * WeakMap so a closed window's counter is collected on its own; the reconcile
+ * tick resets it to 0 when it re-arms a blanked overlay, which is the durable
+ * re-entry path once the fast budget is spent.
+ * @type {WeakMap<object, number>}
+ */
+const overlayReauthAttempts = new WeakMap();
+
+/**
+ * Host-supplied async that re-resolves the pet's CURRENT target and returns a
+ * fresh { baseUrl, token } for THAT origin — a remote instance's own token, or
+ * a re-minted local token that re-establishes the expired same-origin cookie —
+ * or null when no usable credential is available. Returning the target's OWN
+ * token (never the local gateway's token for a remote origin) is what keeps a
+ * remote overlay's re-auth from leaking the local bearer to a different-trust
+ * gateway or looping forever on a token it will never accept. Injected by
+ * mochi/index.js so this module stays free of the host's resolver. Null until
+ * wired.
+ * @type {null | (() => Promise<{baseUrl: string, token: string}|null>)}
+ */
+let reauthTokenProvider = null;
+
+function setPetReauthProvider(fn) {
+  reauthTokenProvider = typeof fn === "function" ? fn : null;
+}
+
+/**
+ * Reload one overlay with a freshly resolved { baseUrl, token } for the pet's
+ * CURRENT target. No usable credential -> stay blank rather than reload with a
+ * wrong or empty token: an empty token 403s again, and the local gateway's
+ * token sent to a remote instance would leak the local bearer and never
+ * authenticate.
+ */
+async function reloadOverlayForCurrentTarget(win) {
+  if (win.isDestroyed() || !reauthTokenProvider) return;
+  let resolved = null;
+  try { resolved = await reauthTokenProvider(); } catch { resolved = null; }
+  // A concurrent instance switch may have torn this overlay down (and built a
+  // replacement) while we awaited. A superseded window must NOT overwrite the
+  // shared target globals — later displays would then load the stale instance —
+  // nor reload itself. isRegisteredOverlay is the liveness check: a closed or
+  // replaced window is no longer a value in the registry.
+  if (win.isDestroyed() || !isRegisteredOverlay(win) || !resolved || !resolved.token) return;
+  // The provider re-resolves the CURRENT target, so a remote instance's
+  // recyclable local port is refreshed here too; update both so overlays built
+  // LATER for other displays load the same fresh origin + token.
+  currentBaseUrl = resolved.baseUrl || currentBaseUrl;
+  currentToken = resolved.token;
+  win.loadURL(mochiPageUrl(currentBaseUrl, "pet.html", currentToken));
+}
+
+/**
+ * One bounded, backed-off inline re-auth attempt for an overlay that just hit a
+ * 401/403. When the budget is spent the overlay stays blank; the reconcile tick
+ * (rearmBlankedOverlays) resets the budget and reloads, so even an auth outage
+ * that outlasts the inline retries still heals without a dedicated timer.
+ */
+async function fastReauthOverlay(win) {
+  const attempt = overlayReauthAttempts.get(win) || 0;
+  if (!shouldReauthOverlay({ attempt, hasProvider: !!reauthTokenProvider })) return;
+  overlayReauthAttempts.set(win, attempt + 1);
+  await new Promise((r) => setTimeout(r, overlayReauthDelayMs(attempt)));
+  await reloadOverlayForCurrentTarget(win);
+}
+
+/**
+ * Re-arm every overlay still stuck on an error page: reset its fast-retry budget
+ * and reload it with a fresh token. The host calls this from its reconcile tick,
+ * which is the re-entry path once the inline retries are spent — no extra timer,
+ * and it recovers a transient 5xx as well as an expired token.
+ */
+function rearmBlankedOverlays() {
+  for (const [, win] of overlays) {
+    if (win.isDestroyed() || !overlayBlanked.has(win)) continue;
+    overlayReauthAttempts.set(win, 0);
+    reloadOverlayForCurrentTarget(win);
+  }
+}
+
+/** True while `win` is still a live overlay in the registry (not torn down). */
+function isRegisteredOverlay(win) {
+  for (const w of overlays.values()) if (w === win) return true;
+  return false;
+}
+
 // ── Overlay registry (broadcastService.ts, overlay half) ───────────────────
 
 /** @type {Map<number, BrowserWindow>} displayId -> overlay */
@@ -590,6 +740,27 @@ function createOverlayForDisplay(display) {
     const safeUrl = String(url || "").split("?")[0];
     console.warn(`Mochi pet: load failed (${code} ${desc}) for ${safeUrl}`);
   });
+
+  // A gateway error page (any status >= 400) is a COMPLETED navigation, not a
+  // did-fail-load, so without this the frameless full-display overlay would
+  // reveal it with no way to close it. Hide on ANY error status; separately, an
+  // auth error (401/403) can heal with a fresh token, so kick off a bounded fast
+  // retry. Anything still blank is re-armed by the host's reconcile tick.
+  win.webContents.on("did-navigate", (_e, _url, httpResponseCode) => {
+    if (win.isDestroyed()) return;
+    if (!isOverlayErrorPage(httpResponseCode)) {
+      overlayBlanked.delete(win); // a good load clears the latch
+      overlayReauthAttempts.delete(win);
+      return;
+    }
+    overlayBlanked.add(win);
+    win.hide();
+    if (isOverlayAuthFailure(httpResponseCode)) {
+      fastReauthOverlay(win);
+    } else {
+      console.warn(`Mochi pet: gateway error page (HTTP ${httpResponseCode}); overlay hidden, re-armed on reconcile`);
+    }
+  });
   win.webContents.on("render-process-gone", (_e, details) => {
     console.warn("Mochi pet: renderer gone —", details && details.reason);
     // Tear down so the reconcile loop recreates it: isDestroyed() stays false
@@ -639,7 +810,11 @@ function wireHandshake(win, displayId, pos) {
     };
     send();
     setTimeout(send, 300);
-    if (!win.isVisible()) win.showInactive();
+    // Never reveal an overlay currently hidden on a gateway error page (see the
+    // did-navigate latch): showing it would blanket the display with an
+    // uncloseable page. A healed reload clears the latch and re-fires
+    // did-finish-load, which then shows the pet.
+    if (!overlayBlanked.has(win) && !win.isVisible()) win.showInactive();
     startHitPoll();
     assertHostStaysInDock();
   });
@@ -775,7 +950,11 @@ function showPetWindow() {
   for (const win of overlays.values()) {
     if (win.isDestroyed()) continue;
     win.setAlwaysOnTop(true, "screen-saver");
-    if (!win.isVisible()) win.showInactive();
+    // Honor the error-page latch: the hide-all restore must not re-reveal an
+    // overlay currently hidden on a gateway error page (same guard as the
+    // load-finished handler), or CMD+SHIFT+H would bring the uncloseable page
+    // back after a persisted auth failure.
+    if (!overlayBlanked.has(win) && !win.isVisible()) win.showInactive();
   }
 }
 
@@ -859,7 +1038,9 @@ async function transferPetToDisplayById(displayId, localX, localY) {
           resolve(true);
         }, 300);
       });
-      win.showInactive();
+      // Do not reveal an overlay hidden on a gateway error page (see the
+      // did-navigate latch); a healed reload clears the latch and shows it.
+      if (!overlayBlanked.has(win) && !win.isVisible()) win.showInactive();
     });
   }
 
@@ -881,14 +1062,23 @@ module.exports = {
   transferPetToDisplayById,
   getSavedPetPos,
   broadcastToOverlays,
+  setPetReauthProvider,
+  rearmBlankedOverlays,
   // Exported for tests: the pure geometry decisions, no Electron needed.
   _inRect: inRect,
   _shouldIgnoreAt: shouldIgnoreAt,
   _clampLocal: clampLocal,
   _findNearestDisplay: findNearestDisplay,
+  // Exported for tests: the pure overlay error/auth-failure recovery policy.
+  _isOverlayAuthFailure: isOverlayAuthFailure,
+  _isOverlayErrorPage: isOverlayErrorPage,
+  _shouldReauthOverlay: shouldReauthOverlay,
+  _overlayReauthDelayMs: overlayReauthDelayMs,
+  OVERLAY_REAUTH_MAX_RETRIES,
   // Exported for tests: overlay-map lifecycle (identity-checked cleanup).
   _registerOverlay: registerOverlay,
   _getOverlays: getOverlays,
+  _isRegisteredOverlay: isRegisteredOverlay,
   PET_W,
   PET_H,
   POLL_MS,

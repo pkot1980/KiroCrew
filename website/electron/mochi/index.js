@@ -691,7 +691,7 @@ async function reconcileMochiAfterCurrent() {
 }
 
 async function reconcileMochi() {
-  const { openPetWindow, closePetWindow } = require("./petOverlays");
+  const { openPetWindow, closePetWindow, rearmBlankedOverlays } = require("./petOverlays");
   const {
     closeAvatarWindowFromReconcile,
     setAvatarBaseUrl,
@@ -809,6 +809,10 @@ async function reconcileMochi() {
   // window is now the Avatars gallery, opened on demand rather than at startup.
   closeAvatarWindowFromReconcile();
   openPetWindow(mochiPetBaseUrl, mochiPetToken);
+  // An overlay stuck on a gateway error page (auth expiry or a transient 5xx)
+  // has hidden itself; re-arm it here so the 5s reconcile is its re-entry path,
+  // not a one-shot retry that leaves it blank until the app restarts.
+  rearmBlankedOverlays();
   // Fully enabled again: bring the panel back if disable had hidden it.
   restorePanelOnEnable(mochiPetBaseUrl, mochiPetToken);
   // FIRST OPEN: on the first enabled tick of a session (fresh enable, or the pet
@@ -1185,6 +1189,36 @@ function initMochi(deps) {
   BACKEND_URL = deps.backendUrl;
   fetchLocalToken = deps.fetchLocalToken;
   glog = deps.glog;
+  // Re-authenticate a blanked pet overlay with the CURRENT target's OWN token.
+  // Registered ONCE here rather than per reconcile tick. A remote overlay must
+  // never be handed the local gateway's token — that leaks the local bearer to
+  // a different-trust origin and can never authenticate.
+  require("./petOverlays").setPetReauthProvider(async () => {
+    const target = await resolveMochiTarget(petInstanceOf(machineStore));
+    if (target.keep) return null; // couldn't resolve — leave the overlay blank
+    // Only REFRESH the current target's token here; never SWITCH targets. The
+    // reconcile loop owns switches (it tears down and rebuilds the windows and
+    // retargets the panel/settings/avatar). If the resolver would land on a
+    // different instance or origin than the overlay currently shows — e.g. a
+    // down remote falling back to self, or a recycled local port — return null
+    // and let reconciliation perform the switch, rather than reloading the live
+    // overlay onto the wrong gateway behind reconcile's back.
+    if (target.instanceId !== mochiPetInstanceId || target.baseUrl !== mochiPetBaseUrl) {
+      return null;
+    }
+    if (target.instanceId === SELF_INSTANCE) {
+      // The local overlay authenticates by the same-origin cookie, now expired
+      // (that IS the bug). Re-mint a local token and carry it on the URL so the
+      // gateway re-establishes the cookie; the STALE cached token is what 403'd,
+      // so clear it first. Clearing is scoped to self.
+      cachedGatewayToken = "";
+      const token = await gatewayToken();
+      return token ? { baseUrl: BACKEND_URL, token } : null;
+    }
+    // Remote (unchanged instance + origin): resolveMochiTarget re-minted and
+    // validated the remote token over core's control plane.
+    return { baseUrl: target.baseUrl, token: target.token };
+  });
   startMochiWatcher();
 }
 

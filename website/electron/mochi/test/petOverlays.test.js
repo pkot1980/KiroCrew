@@ -144,3 +144,161 @@ test("a stale closed handler does not evict the replacement overlay", () => {
     _getOverlays().delete(DID);
   }
 });
+
+// ── Overlay auth-failure recovery ──────────────────────────────────────────
+// A pet overlay covers a whole frameless, click-through display, so a gateway
+// token-required page (401/403) rendered in it would trap the user behind an
+// uncloseable full-screen error page (the reported "403 after sleep" bug). A
+// 401/403 is a COMPLETED navigation, so the only signal is the status code.
+const {
+  _isOverlayAuthFailure,
+  _isOverlayErrorPage,
+  _shouldReauthOverlay,
+  _overlayReauthDelayMs,
+  OVERLAY_REAUTH_MAX_RETRIES,
+} = require("../petOverlays");
+
+test("only 401/403 count as an auth-failure navigation", () => {
+  assert.equal(_isOverlayAuthFailure(401), true);
+  assert.equal(_isOverlayAuthFailure(403), true);
+  // A successful pet load and non-auth errors must NOT trigger a token re-mint,
+  // which cannot fix them.
+  assert.equal(_isOverlayAuthFailure(200), false);
+  assert.equal(_isOverlayAuthFailure(304), false);
+  assert.equal(_isOverlayAuthFailure(404), false);
+  assert.equal(_isOverlayAuthFailure(500), false);
+  assert.equal(_isOverlayAuthFailure(undefined), false);
+});
+
+test("hiding is decoupled from re-auth: ANY >=400 page is an error page", () => {
+  // The reported harm is "an opaque page blankets the display" — a 404/500 body
+  // is a completed navigation and traps the user identically, so the hide
+  // decision must cover all of them, not only the auth statuses.
+  assert.equal(_isOverlayErrorPage(400), true);
+  assert.equal(_isOverlayErrorPage(401), true);
+  assert.equal(_isOverlayErrorPage(403), true);
+  assert.equal(_isOverlayErrorPage(404), true);
+  assert.equal(_isOverlayErrorPage(500), true);
+  assert.equal(_isOverlayErrorPage(503), true);
+  // Success and redirects are NOT error pages.
+  assert.equal(_isOverlayErrorPage(200), false);
+  assert.equal(_isOverlayErrorPage(301), false);
+  assert.equal(_isOverlayErrorPage(304), false);
+  assert.equal(_isOverlayErrorPage(undefined), false);
+  // A 500 must hide (error page) but NOT trigger a token re-mint (not auth).
+  assert.equal(_isOverlayErrorPage(500) && !_isOverlayAuthFailure(500), true);
+});
+
+test("re-auth is attempted while retries remain and a provider is wired", () => {
+  for (let attempt = 0; attempt < OVERLAY_REAUTH_MAX_RETRIES; attempt++) {
+    assert.equal(_shouldReauthOverlay({ attempt, hasProvider: true }), true);
+  }
+});
+
+test("re-auth stops once the retry budget is spent, so the overlay stays blank", () => {
+  // Blank is safe (the pet is briefly absent); an endless reload loop or a shown
+  // error page is not.
+  assert.equal(_shouldReauthOverlay({ attempt: OVERLAY_REAUTH_MAX_RETRIES, hasProvider: true }), false);
+});
+
+test("re-auth never runs without a token provider", () => {
+  // With no way to re-mint, retrying can only re-fetch the same 403 forever;
+  // the overlay must just stay hidden.
+  assert.equal(_shouldReauthOverlay({ attempt: 0, hasProvider: false }), false);
+});
+
+test("re-auth backoff grows exponentially and caps at 2s", () => {
+  assert.equal(_overlayReauthDelayMs(0), 500);
+  assert.equal(_overlayReauthDelayMs(1), 1000);
+  assert.equal(_overlayReauthDelayMs(2), 2000);
+  assert.equal(_overlayReauthDelayMs(3), 2000, "capped, never unbounded");
+});
+
+// Source guard: the fix only works if did-navigate drives the recovery, hides on
+// ANY error page, and the load-finished handler refuses to reveal a blanked
+// overlay. Electron wiring cannot be imported here, so assert the real source.
+const fs = require("node:fs");
+const path = require("node:path");
+test("createOverlayForDisplay hides on any error page and re-auths only on 401/403", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "petOverlays.js"), "utf8");
+  assert.match(src, /did-navigate/, "must hook did-navigate (an error page is not a did-fail-load)");
+  // Hide is gated on the general error-page test, not on the auth test.
+  assert.match(src, /isOverlayErrorPage\(httpResponseCode\)[\s\S]{0,200}win\.hide\(\)/,
+    "an error page (>=400) must hide the overlay");
+  assert.match(src, /isOverlayAuthFailure\(httpResponseCode\)[\s\S]{0,60}fastReauthOverlay/,
+    "only an auth failure kicks off the token re-mint");
+  assert.match(
+    src,
+    /!overlayBlanked\.has\(win\)[\s\S]{0,120}showInactive/,
+    "the load-finished handler must refuse to reveal a blanked overlay",
+  );
+});
+
+test("re-arm is driven by the reconcile tick, and the provider is wired once", () => {
+  // Fable finding 2/3: recovery must not be one-shot, and the provider must not
+  // be re-registered on the 5s reconcile hot path.
+  const overlaySrc = fs.readFileSync(path.join(__dirname, "..", "petOverlays.js"), "utf8");
+  assert.match(overlaySrc, /function rearmBlankedOverlays\(\)/, "petOverlays must expose the re-entry path");
+  const idxSrc = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  assert.match(idxSrc, /rearmBlankedOverlays\(\)/, "reconcile must call the re-entry path each tick");
+  // Registered exactly once, inside initMochi (defined near EOF, after
+  // reconcileMochi), NOT on the 5s reconcile hot path.
+  const initAt = idxSrc.indexOf("function initMochi");
+  const provCount = (idxSrc.match(/setPetReauthProvider\(/g) || []).length;
+  const provAt = idxSrc.indexOf("setPetReauthProvider(");
+  assert.equal(provCount, 1, "the provider must be registered exactly once");
+  assert.ok(initAt >= 0 && provAt > initAt,
+    "setPetReauthProvider must be registered inside initMochi, not per reconcile tick");
+});
+
+test("re-auth re-resolves the target and never hands a remote overlay the local token", () => {
+  // Regression guard for the credential-exposure / permanently-blank bug: the
+  // provider must re-resolve the CURRENT target for its OWN token, and clear the
+  // local token cache only for self — never blindly mint the local token and
+  // send it to whatever origin the overlay is showing.
+  const idxSrc = fs.readFileSync(path.join(__dirname, "..", "index.js"), "utf8");
+  const at = idxSrc.indexOf("setPetReauthProvider(");
+  assert.ok(at >= 0, "the reauth provider must be registered");
+  const region = idxSrc.slice(at, at + 900);
+  assert.match(region, /resolveMochiTarget/, "must re-resolve the current target for its own token");
+  assert.match(region, /SELF_INSTANCE/, "must distinguish self from remote before clearing the local cache");
+  // The provider must REFRESH only, never SWITCH: bail to reconcile when the
+  // resolved target differs from what the overlay currently shows.
+  assert.match(region, /target\.instanceId !== mochiPetInstanceId \|\| target\.baseUrl !== mochiPetBaseUrl[\s\S]{0,40}return null/,
+    "re-auth must not switch targets behind reconcile's back");
+});
+
+// A superseded overlay (torn down by a concurrent instance switch mid-backoff)
+// must not overwrite the shared target globals or reload itself, or later
+// displays load the stale instance. isRegisteredOverlay is that liveness gate.
+test("isRegisteredOverlay tracks whether a window is still in the registry", () => {
+  const { _isRegisteredOverlay, _registerOverlay, _getOverlays } = require("../petOverlays");
+  const DID = 99231;
+  const win = { on() {} };
+  assert.equal(_isRegisteredOverlay(win), false, "unregistered window is not live");
+  _registerOverlay(DID, win);
+  try {
+    assert.equal(_isRegisteredOverlay(win), true, "registered window is live");
+    _getOverlays().delete(DID); // simulate teardown by an instance switch
+    assert.equal(_isRegisteredOverlay(win), false, "a torn-down window is no longer live");
+  } finally {
+    _getOverlays().delete(DID);
+  }
+});
+
+test("re-auth reload refuses a superseded window and every reveal path honors the latch", () => {
+  const overlaySrc = fs.readFileSync(path.join(__dirname, "..", "petOverlays.js"), "utf8");
+  // The async reload must re-check the window is still registered AFTER the
+  // await, before touching the shared globals (GPT 5.6 blocking race).
+  assert.match(
+    overlaySrc,
+    /!isRegisteredOverlay\(win\)[\s\S]{0,40}!resolved[\s\S]{0,40}return;/,
+    "reload must drop a superseded window before overwriting currentBaseUrl/currentToken",
+  );
+  // EVERY win.showInactive() reveal is guarded by the blanked latch, so no path
+  // (handshake, hide-all restore, display transfer) can re-reveal an error page.
+  const reveals = overlaySrc.match(/win\.showInactive\(\)/g) || [];
+  const guarded = overlaySrc.match(/!overlayBlanked\.has\(win\)[\s\S]{0,80}win\.showInactive\(\)/g) || [];
+  assert.ok(reveals.length >= 3, "expected the three overlay reveal sites");
+  assert.equal(guarded.length, reveals.length, "every showInactive reveal must be latch-guarded");
+});
